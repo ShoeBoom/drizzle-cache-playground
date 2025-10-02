@@ -168,6 +168,7 @@ export class UpstashCache extends Cache {
     isTag: boolean = false,
     config?: CacheConfig
   ): Promise<void> {
+    console.log("put", key, response, tables, isTag, config);
     const isAutoInvalidate = tables.length !== 0;
 
     const pipeline = this.redis.pipeline();

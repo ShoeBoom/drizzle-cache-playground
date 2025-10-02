@@ -1,6 +1,6 @@
 import { PGlite } from "@electric-sql/pglite";
 import "dotenv/config";
-import { upstashCache } from "drizzle-orm/cache/upstash";
+import { upstashCache } from "./cache";
 import { drizzle } from "drizzle-orm/pglite";
 
 const client = new PGlite("./pgdata");
