@@ -1,3 +1,0 @@
-#!/usr/bin/env bash
-cmd="$*"
-pnpm run db:start --include-database-url --run "$cmd"
