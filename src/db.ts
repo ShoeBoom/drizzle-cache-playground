@@ -3,7 +3,7 @@ import "dotenv/config";
 import { upstashCache } from "drizzle-orm/cache/upstash";
 import { drizzle } from "drizzle-orm/pglite";
 
-const client = new PGlite();
+const client = new PGlite("./pgdata");
 
 export const db = drizzle({
   client,
