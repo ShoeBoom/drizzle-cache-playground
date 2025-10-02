@@ -1,108 +1,266 @@
-import Keyv from "keyv";
+import { Redis } from "@upstash/redis";
+import type { MutationOption } from "drizzle-orm/cache/core";
 import { Cache } from "drizzle-orm/cache/core";
+import { entityKind, is } from "drizzle-orm/entity";
+import { getTableName, Table } from "drizzle-orm";
 import type { CacheConfig } from "drizzle-orm/cache/core/types";
-import { getTableName, is, Table } from "drizzle-orm";
 
-export class TestGlobalCache extends Cache {
-  private globalTtl: number = 1000;
-  // This object will be used to store which query keys were used
-  // for a specific table, so we can later use it for invalidation.
-  private usedTablesPerKey: Record<string, string[]> = {};
+const getByTagScript = `
+local tagsMapKey = KEYS[1] -- tags map key
+local tag        = ARGV[1] -- tag
 
-  constructor(private kv: Keyv = new Keyv()) {
+local compositeTableName = redis.call('HGET', tagsMapKey, tag)
+if not compositeTableName then
+  return nil
+end
+
+local value = redis.call('HGET', compositeTableName, tag)
+return value
+`;
+
+const onMutateScript = `
+local tagsMapKey = KEYS[1] -- tags map key
+local tables     = {}      -- initialize tables array
+local tags       = ARGV    -- tags array
+
+for i = 2, #KEYS do
+  tables[#tables + 1] = KEYS[i] -- add all keys except the first one to tables
+end
+
+if #tags > 0 then
+  for _, tag in ipairs(tags) do
+    if tag ~= nil and tag ~= '' then
+      local compositeTableName = redis.call('HGET', tagsMapKey, tag)
+      if compositeTableName then
+        redis.call('HDEL', compositeTableName, tag)
+      end
+    end
+  end
+  redis.call('HDEL', tagsMapKey, unpack(tags))
+end
+
+local keysToDelete = {}
+
+if #tables > 0 then
+  local compositeTableNames = redis.call('SUNION', unpack(tables))
+  for _, compositeTableName in ipairs(compositeTableNames) do
+    keysToDelete[#keysToDelete + 1] = compositeTableName
+  end
+  for _, table in ipairs(tables) do
+    keysToDelete[#keysToDelete + 1] = table
+  end
+  redis.call('DEL', unpack(keysToDelete))
+end
+`;
+
+type Script = ReturnType<Redis["createScript"]>;
+
+type ExpireOptions = "NX" | "nx" | "XX" | "xx" | "GT" | "gt" | "LT" | "lt";
+
+export class UpstashCache extends Cache {
+  static override readonly [entityKind]: string = "UpstashCache";
+  /**
+   * Prefix for sets which denote the composite table names for each unique table
+   *
+   * Example: In the composite table set of "table1", you may find
+   * `${compositeTablePrefix}table1,table2` and `${compositeTablePrefix}table1,table3`
+   */
+  private static compositeTableSetPrefix = "__CTS__";
+  /**
+   * Prefix for hashes which map hash or tags to cache values
+   */
+  private static compositeTablePrefix = "__CT__";
+  /**
+   * Key which holds the mapping of tags to composite table names
+   *
+   * Using this tagsMapKey, you can find the composite table name for a given tag
+   * and get the cache value for that tag:
+   *
+   * ```ts
+   * const compositeTable = redis.hget(tagsMapKey, 'tag1')
+   * console.log(compositeTable) // `${compositeTablePrefix}table1,table2`
+   *
+   * const cachevalue = redis.hget(compositeTable, 'tag1')
+   */
+  private static tagsMapKey = "__tagsMap__";
+  /**
+   * Queries whose auto invalidation is false aren't stored in their respective
+   * composite table hashes because those hashes are deleted when a mutation
+   * occurs on related tables.
+   *
+   * Instead, they are stored in a separate hash with the prefix
+   * `__nonAutoInvalidate__` to prevent them from being deleted when a mutation
+   */
+  private static nonAutoInvalidateTablePrefix = "__nonAutoInvalidate__";
+
+  private luaScripts: {
+    getByTagScript: Script;
+    onMutateScript: Script;
+  };
+
+  private internalConfig: { seconds: number; hexOptions?: ExpireOptions };
+
+  constructor(
+    public redis: Redis,
+    config?: CacheConfig,
+    protected useGlobally?: boolean
+  ) {
     super();
+    this.internalConfig = this.toInternalConfig(config);
+    this.luaScripts = {
+      getByTagScript: this.redis.createScript(getByTagScript, {
+        readonly: true,
+      }),
+      onMutateScript: this.redis.createScript(onMutateScript),
+    };
   }
 
-  // For the strategy, we have two options:
-  // - 'explicit': The cache is used only when .$withCache() is added to a query.
-  // - 'all': All queries are cached globally.
-  // The default behavior is 'explicit'.
-  override strategy(): "explicit" | "all" {
-    return "all";
+  public strategy() {
+    return this.useGlobally ? "all" : "explicit";
   }
 
-  // This function accepts query and parameters that cached into key param,
-  // allowing you to retrieve response values for this query from the cache.
-  override async get(key: string): Promise<any[] | undefined> {
-    const res = (await this.kv.get(key)) ?? undefined;
-    return res;
+  private toInternalConfig(config?: CacheConfig): {
+    seconds: number;
+    hexOptions?: ExpireOptions;
+  } {
+    return config
+      ? {
+          seconds: config.ex!,
+          hexOptions: config.hexOptions,
+        }
+      : {
+          seconds: 1,
+        };
   }
 
-  // This function accepts several options to define how cached data will be stored:
-  // - 'key': A hashed query and parameters.
-  // - 'response': An array of values returned by Drizzle from the database.
-  // - 'tables': An array of tables involved in the select queries. This information is needed for cache invalidation.
-  //
-  // For example, if a query uses the "users" and "posts" tables, you can store this information. Later, when the app executes
-  // any mutation statements on these tables, you can remove the corresponding key from the cache.
-  // If you're okay with eventual consistency for your queries, you can skip this option.
+  override async get(
+    key: string,
+    tables: string[],
+    isTag: boolean = false,
+    isAutoInvalidate?: boolean
+  ): Promise<any[] | undefined> {
+    if (!isAutoInvalidate) {
+      const result = await this.redis.hget(
+        UpstashCache.nonAutoInvalidateTablePrefix,
+        key
+      );
+      return result === null ? undefined : (result as any[]);
+    }
+
+    if (isTag) {
+      const result = await this.luaScripts.getByTagScript.exec(
+        [UpstashCache.tagsMapKey],
+        [key]
+      );
+      return result === null ? undefined : (result as any[]);
+    }
+
+    // Normal cache lookup for the composite key
+    const compositeKey = this.getCompositeKey(tables);
+    const result = (await this.redis.hget(compositeKey, key)) ?? undefined; // Retrieve result for normal query
+    return result === null ? undefined : (result as any[]);
+  }
+
   override async put(
     key: string,
     response: any,
     tables: string[],
-    isTag: boolean,
+    isTag: boolean = false,
     config?: CacheConfig
   ): Promise<void> {
-    const ttl = config?.px ?? (config?.ex ? config.ex * 1000 : this.globalTtl);
+    const isAutoInvalidate = tables.length !== 0;
 
-    await this.kv.set(key, response, ttl);
+    const pipeline = this.redis.pipeline();
+    const ttlSeconds =
+      config && config.ex ? config.ex : this.internalConfig.seconds;
+    const hexOptions =
+      config && config.hexOptions
+        ? config.hexOptions
+        : this.internalConfig?.hexOptions;
+
+    if (!isAutoInvalidate) {
+      if (isTag) {
+        pipeline.hset(UpstashCache.tagsMapKey, {
+          [key]: UpstashCache.nonAutoInvalidateTablePrefix,
+        });
+        pipeline.hexpire(UpstashCache.tagsMapKey, key, ttlSeconds, hexOptions);
+      }
+
+      pipeline.hset(UpstashCache.nonAutoInvalidateTablePrefix, {
+        [key]: response,
+      });
+      pipeline.hexpire(
+        UpstashCache.nonAutoInvalidateTablePrefix,
+        key,
+        ttlSeconds,
+        hexOptions
+      );
+      await pipeline.exec();
+      return;
+    }
+
+    const compositeKey = this.getCompositeKey(tables);
+
+    pipeline.hset(compositeKey, { [key]: response }); // Store the result with the tag under the composite key
+    pipeline.hexpire(compositeKey, key, ttlSeconds, hexOptions); // Set expiration for the composite key
+
+    if (isTag) {
+      pipeline.hset(UpstashCache.tagsMapKey, { [key]: compositeKey }); // Store the tag and its composite key in the map
+      pipeline.hexpire(UpstashCache.tagsMapKey, key, ttlSeconds, hexOptions); // Set expiration for the tag
+    }
 
     for (const table of tables) {
-      const keys = this.usedTablesPerKey[table];
-      if (keys === undefined) {
-        this.usedTablesPerKey[table] = [key];
-      } else {
-        keys.push(key);
-      }
+      pipeline.sadd(this.addTablePrefix(table), compositeKey);
     }
+
+    await pipeline.exec();
   }
 
-  // This function is called when insert, update, or delete statements are executed.
-  // You can either skip this step or invalidate queries that used the affected tables.
-  //
-  // The function receives an object with two keys:
-  // - 'tags': Used for queries labeled with a specific tag, allowing you to invalidate by that tag.
-  // - 'tables': The actual tables affected by the insert, update, or delete statements,
-  //   helping you track which tables have changed since the last cache update.
-  override async onMutate(params: {
-    tags: string | string[];
-    tables: string | string[] | Table<any> | Table<any>[];
-  }): Promise<void> {
-    const tagsArray = params.tags
-      ? Array.isArray(params.tags)
-        ? params.tags
-        : [params.tags]
+  override async onMutate(params: MutationOption) {
+    const tags = Array.isArray(params.tags)
+      ? params.tags
+      : params.tags
+      ? [params.tags]
       : [];
-    const tablesArray = params.tables
-      ? Array.isArray(params.tables)
-        ? params.tables
-        : [params.tables]
+    const tables = Array.isArray(params.tables)
+      ? params.tables
+      : params.tables
+      ? [params.tables]
       : [];
+    const tableNames: string[] = tables.map((table) =>
+      is(table, Table) ? getTableName(table) : (table as string)
+    );
 
-    const keysToDelete = new Set<string>();
-
-    for (const table of tablesArray) {
-      const tableName = is(table, Table)
-        ? getTableName(table)
-        : (table as string);
-      const keys = this.usedTablesPerKey[tableName] ?? [];
-      for (const key of keys) keysToDelete.add(key);
-    }
-
-    if (keysToDelete.size > 0 || tagsArray.length > 0) {
-      for (const tag of tagsArray) {
-        await this.kv.delete(tag);
-      }
-
-      for (const key of keysToDelete) {
-        await this.kv.delete(key);
-        for (const table of tablesArray) {
-          const tableName = is(table, Table)
-            ? getTableName(table)
-            : (table as string);
-          this.usedTablesPerKey[tableName] = [];
-        }
-      }
-    }
+    const compositeTableSets = tableNames.map((table) =>
+      this.addTablePrefix(table)
+    );
+    await this.luaScripts.onMutateScript.exec(
+      [UpstashCache.tagsMapKey, ...compositeTableSets],
+      tags
+    );
   }
+
+  private addTablePrefix = (table: string) =>
+    `${UpstashCache.compositeTableSetPrefix}${table}`;
+  private getCompositeKey = (tables: string[]) =>
+    `${UpstashCache.compositeTablePrefix}${tables.sort().join(",")}`;
+}
+
+export function upstashCache({
+  url,
+  token,
+  config,
+  global = false,
+}: {
+  url: string;
+  token: string;
+  config?: CacheConfig;
+  global?: boolean;
+}): UpstashCache {
+  const redis = new Redis({
+    url,
+    token,
+  });
+
+  return new UpstashCache(redis, config, global);
 }
