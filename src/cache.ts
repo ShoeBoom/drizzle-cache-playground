@@ -139,6 +139,7 @@ export class UpstashCache extends Cache {
     isTag: boolean = false,
     isAutoInvalidate?: boolean
   ): Promise<any[] | undefined> {
+    console.log("get", { key, tables, isTag, isAutoInvalidate });
     if (!isAutoInvalidate) {
       const result = await this.redis.hget(
         UpstashCache.nonAutoInvalidateTablePrefix,
@@ -168,7 +169,7 @@ export class UpstashCache extends Cache {
     isTag: boolean = false,
     config?: CacheConfig
   ): Promise<void> {
-    console.log("put", key, response, tables, isTag, config);
+    console.log("put", { key, response, tables, isTag, config });
     const isAutoInvalidate = tables.length !== 0;
 
     const pipeline = this.redis.pipeline();

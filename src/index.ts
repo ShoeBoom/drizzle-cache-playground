@@ -4,14 +4,18 @@ import { eq } from "drizzle-orm";
 import { usersTable } from "./db/schema.js";
 import { uuid } from "@electric-sql/pglite";
 
-await db.insert(usersTable).values({
-  id: uuid(),
-  email: "cacheman@upstash.com",
-  name: "Cache Man",
-  age: 100,
-});
+// await db.insert(usersTable).values({
+//   id: uuid(),
+//   email: "cacheman@upstash.com",
+//   name: "Cache Man",
+//   age: 100,
+// });
 
-const users = await db.select().from(usersTable).$withCache();
+const users = await db
+  .select()
+  .from(usersTable)
+  .where(eq(usersTable.email, "cacheman@upstash.com"))
+  .$withCache();
 
 // await db.$cache.invalidate({ tables: users });
 
