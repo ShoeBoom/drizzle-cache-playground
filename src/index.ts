@@ -15,7 +15,7 @@ const users = await db
   .select()
   .from(usersTable)
   .where(eq(usersTable.email, "cacheman@upstash.com"))
-  .$withCache();
+  .$withCache({ tag: "user.email.cacheman@upstash.com" });
 
 // await db.$cache.invalidate({ tables: users });
 
