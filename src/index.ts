@@ -11,23 +11,37 @@ import { uuid } from "@electric-sql/pglite";
 //   age: 100,
 // });
 
-const users = await db
+const user = await db
   .select()
   .from(usersTable)
   .where(eq(usersTable.email, "cacheman@upstash.com"))
   .$withCache({ tag: "user.email.cacheman@upstash.com" });
 
+const user2 = await db
+  .select()
+  .from(usersTable)
+  .where(eq(usersTable.email, "cacheman2@upstash.com"))
+  .$withCache({ tag: "user.email.cacheman2@upstash.com" });
+
 // await db.$cache.invalidate({ tables: users });
 
-// await db
-//   .update(users)
-//   .set({ name: "wowman" })
-//   .where(eq(users.id, user1[0]?.id!));
+await db
+  .update(usersTable)
+  .set({ name: "wowman" })
+  .where(eq(usersTable.id, user[0]!.id));
+
+const userAfter = await db
+  .select()
+  .from(usersTable)
+  .where(eq(usersTable.email, user2[0]!.email))
+  .$withCache({ tag: `user.email.${user2[0]!.email}` });
 
 console.log(
   JSON.stringify(
     {
-      users,
+      user,
+      user2,
+      userAfter,
     },
     null,
     2
