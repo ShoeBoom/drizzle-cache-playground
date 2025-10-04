@@ -30,18 +30,18 @@ await db
   .set({ name: "wowman" })
   .where(eq(usersTable.id, user[0]!.id));
 
-const userAfter = await db
-  .select()
-  .from(usersTable)
-  .where(eq(usersTable.email, user2[0]!.email))
-  .$withCache({ tag: `user.email.${user2[0]!.email}` });
+// const userAfter = await db
+//   .select()
+//   .from(usersTable)
+//   .where(eq(usersTable.email, user2[0]!.email))
+//   .$withCache({ tag: `user.email.${user2[0]!.email}` });
 
 console.log(
   JSON.stringify(
     {
       user,
       user2,
-      userAfter,
+      // userAfter,
     },
     null,
     2
