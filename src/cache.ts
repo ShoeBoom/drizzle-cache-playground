@@ -219,6 +219,7 @@ export class UpstashCache extends Cache {
   }
 
   override async onMutate(params: MutationOption) {
+    console.log("onMutate", params);
     const tags = Array.isArray(params.tags)
       ? params.tags
       : params.tags
